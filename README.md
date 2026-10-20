@@ -35,3 +35,4 @@ Prérequis : OBS Studio installé (fournit le pilote de caméra virtuelle).
 
 ## Fonctions de l'app
 - Appuyer sur l'aperçu : mise au point + exposition à l'endroit touché (retour à l'autofocus continu après 3 s).
+- Bouton « Image » : curseurs luminosité (compensation d'exposition) et contraste (courbe de tons), mémorisés entre les lancements.

@@ -11,11 +11,13 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.MeteringRectangle
+import android.hardware.camera2.params.TonemapCurve
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
@@ -25,10 +27,14 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.WindowManager
+import android.widget.LinearLayout
+import android.widget.SeekBar
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.TextView
 import kotlin.math.min
+import kotlin.math.pow
+import kotlin.math.roundToInt
 
 /** Étape 2 : aperçu caméra + encodage H.264 + serveur TCP (caméra arrière/avant commutable). */
 class MainActivity : Activity() {
@@ -40,12 +46,23 @@ class MainActivity : Activity() {
         const val REQ_CAMERA = 1
         const val FOCUS_REGION_RATIO = 0.16f   // taille de la zone de mise au point (fraction de la hauteur visible)
         const val FOCUS_REVERT_MS = 3000L      // retour à l'autofocus continu après un tap
+        const val SLIDER_STEPS = 200           // curseurs luminosité / contraste : -1..1 en 200 pas
+        const val CURVE_POINTS = 64
+        const val CONTRAST_STRENGTH = 0.8f
     }
 
     private lateinit var surfaceView: SurfaceView
     private lateinit var switchButton: Button
     private lateinit var status: TextView
     private lateinit var focusRing: FocusRingView
+    private lateinit var brightnessLabel: TextView
+    private lateinit var brightnessBar: SeekBar
+    private lateinit var contrastLabel: TextView
+    private lateinit var contrastBar: SeekBar
+
+    // Réglages image, -1..1 (écrits côté UI, lus côté cameraHandler)
+    @Volatile private var brightness = 0f
+    @Volatile private var contrast = 0f
     private val cameraThread = HandlerThread("camera").also { it.start() }
     private val cameraHandler = Handler(cameraThread.looper)
 
@@ -75,12 +92,60 @@ class MainActivity : Activity() {
         }
         status = TextView(this).apply { setTextColor(Color.WHITE); setPadding(24, 24, 24, 24) }
         focusRing = FocusRingView(this)
+        val prefs = getSharedPreferences("image", MODE_PRIVATE)
+        brightness = prefs.getFloat("brightness", 0f)
+        contrast = prefs.getFloat("contrast", 0f)
+
+        brightnessLabel = TextView(this).apply { setTextColor(Color.WHITE) }
+        contrastLabel = TextView(this).apply { setTextColor(Color.WHITE) }
+        brightnessBar = makeSlider(brightness) { v ->
+            brightness = v
+            prefs.edit().putFloat("brightness", v).apply()
+            updateImageLabels()
+            cameraHandler.post { updateImageSettings() }
+        }
+        contrastBar = makeSlider(contrast) { v ->
+            contrast = v
+            prefs.edit().putFloat("contrast", v).apply()
+            updateImageLabels()
+            cameraHandler.post { updateImageSettings() }
+        }
+        val resetButton = Button(this).apply {
+            text = "Réinitialiser"
+            setOnClickListener {
+                brightnessBar.progress = SLIDER_STEPS / 2
+                contrastBar.progress = SLIDER_STEPS / 2
+            }
+        }
+        val dp = resources.displayMetrics.density
+        val imagePanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.argb(160, 0, 0, 0))
+            setPadding((16 * dp).toInt(), (12 * dp).toInt(), (16 * dp).toInt(), (12 * dp).toInt())
+            visibility = View.GONE
+            addView(brightnessLabel)
+            addView(brightnessBar)
+            addView(contrastLabel)
+            addView(contrastBar)
+            addView(resetButton)
+        }
+        val imageButton = Button(this).apply {
+            text = "Image"
+            setOnClickListener {
+                imagePanel.visibility = if (imagePanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+            }
+        }
+        updateImageLabels()
         val root = FrameLayout(this).apply {
             setBackgroundColor(Color.BLACK)
             addView(surfaceView, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
             addView(focusRing, FrameLayout.LayoutParams(focusRing.size, focusRing.size, Gravity.TOP or Gravity.START))
             addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START))
-            addView(switchButton, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END))
+            addView(imagePanel, FrameLayout.LayoutParams((300 * dp).toInt(), -2, Gravity.BOTTOM or Gravity.START))
+            addView(LinearLayout(this@MainActivity).apply {
+                addView(imageButton)
+                addView(switchButton)
+            }, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.END))
         }
         setContentView(root)
 
@@ -197,6 +262,8 @@ class MainActivity : Activity() {
             override fun onConfigured(s: CameraCaptureSession) {
                 session = s
                 characteristics = chars
+                val contrastOk = supportsContrast(chars)
+                runOnUiThread { contrastBar.isEnabled = contrastOk; updateImageLabels() }
                 val ranges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
                 val fpsRange = ranges?.firstOrNull { it.lower == FPS && it.upper == FPS }
                     ?: ranges?.firstOrNull { it.upper == FPS }
@@ -209,12 +276,78 @@ class MainActivity : Activity() {
                     }
                 }
                 previewRequest = req
+                applyImageSettings(req)
                 s.setRepeatingRequest(req.build(), null, cameraHandler)
                 enc.requestKeyframe()
                 setStatus()
             }
             override fun onConfigureFailed(s: CameraCaptureSession) { setStatus("Échec de configuration de la session") }
         }, cameraHandler)
+    }
+
+    private fun makeSlider(initial: Float, onChange: (Float) -> Unit) = SeekBar(this).apply {
+        max = SLIDER_STEPS
+        progress = ((initial + 1f) / 2f * SLIDER_STEPS).roundToInt()
+        setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(bar: SeekBar, value: Int, fromUser: Boolean) {
+                onChange(value * 2f / SLIDER_STEPS - 1f)
+            }
+            override fun onStartTrackingTouch(bar: SeekBar) {}
+            override fun onStopTrackingTouch(bar: SeekBar) {}
+        })
+    }
+
+    private fun updateImageLabels() {
+        brightnessLabel.text = "Luminosité : %+.2f".format(brightness)
+        contrastLabel.text = if (contrastBar.isEnabled) "Contraste : %+.2f".format(contrast) else "Contraste : non supporté par cette caméra"
+    }
+
+    private fun supportsContrast(c: CameraCharacteristics): Boolean {
+        val modes = c.get(CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES)
+        val points = c.get(CameraCharacteristics.TONEMAP_MAX_CURVE_POINTS) ?: 0
+        return modes?.contains(CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE) == true && points >= CURVE_POINTS
+    }
+
+    /** Courbe sRGB + contraste en S (smoothstep) dosé par c dans -1..1. */
+    private fun contrastCurve(c: Float): TonemapCurve {
+        val k = c * CONTRAST_STRENGTH
+        val pts = FloatArray(CURVE_POINTS * 2)
+        for (i in 0 until CURVE_POINTS) {
+            val x = i / (CURVE_POINTS - 1f)
+            val g = if (x <= 0.0031308f) 12.92f * x else 1.055f * x.pow(1f / 2.4f) - 0.055f
+            val smooth = g * g * (3f - 2f * g)
+            pts[2 * i] = x
+            pts[2 * i + 1] = (g + k * (smooth - g)).coerceIn(0f, 1f)
+        }
+        return TonemapCurve(pts, pts, pts)
+    }
+
+    /** Applique luminosité (compensation d'exposition) et contraste (courbe de tons) au builder. */
+    private fun applyImageSettings(req: CaptureRequest.Builder) {
+        val c = characteristics ?: return
+        val range = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+        if (range != null) {
+            val b = brightness
+            val steps = if (b >= 0f) b * range.upper else b * -range.lower
+            req.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, steps.roundToInt().coerceIn(range.lower, range.upper))
+        }
+        if (contrast != 0f && supportsContrast(c)) {
+            req.set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_CONTRAST_CURVE)
+            req.set(CaptureRequest.TONEMAP_CURVE, contrastCurve(contrast))
+        } else {
+            req.set(CaptureRequest.TONEMAP_MODE, CameraMetadata.TONEMAP_MODE_FAST)
+        }
+    }
+
+    private fun updateImageSettings() {
+        val s = session ?: return
+        val req = previewRequest ?: return
+        try {
+            applyImageSettings(req)
+            s.setRepeatingRequest(req.build(), null, cameraHandler)
+        } catch (_: CameraAccessException) {
+        } catch (_: IllegalStateException) {
+        }
     }
 
     /** Tap-to-focus : (nx, ny) = position du toucher normalisée (0..1) dans l'aperçu. Appelé depuis cameraHandler. */
