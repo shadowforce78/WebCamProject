@@ -1,0 +1,4 @@
+numpy
+av
+pyvirtualcam
+opencv-python

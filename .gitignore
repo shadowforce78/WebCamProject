@@ -1,0 +1,20 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Android / Gradle
+.gradle/
+.kotlin/
+build/
+local.properties
+*.iml
+.idea/
+*.apk
+
+# Captures de test locales
+samples/
+
+# Divers
+.DS_Store
+Thumbs.db
